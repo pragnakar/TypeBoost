@@ -1,0 +1,46 @@
+name: TypeBoost
+options:
+  bundleIdPrefix: com.typeboost
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    CODE_SIGN_IDENTITY: "-"
+    PRODUCT_BUNDLE_IDENTIFIER: com.typeboost.app
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_ENTITLEMENTS: TypeBoost/TypeBoost.entitlements
+
+targets:
+  TypeBoost:
+    type: application
+    platform: macOS
+    sources:
+      - TypeBoost
+    settings:
+      base:
+        INFOPLIST_FILE: TypeBoost/Info.plist
+        PRODUCT_NAME: TypeBoost
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        COMBINE_HIDPI_IMAGES: YES
+    entitlements:
+      path: TypeBoost/TypeBoost.entitlements
+
+  TypeBoostTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - TypeBoostTests
+    dependencies:
+      - target: TypeBoost
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/TypeBoost.app/Contents/MacOS/TypeBoost"
