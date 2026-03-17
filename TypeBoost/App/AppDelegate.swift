@@ -122,13 +122,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 if enabled && self.permissionManager.hasRequiredPermissions {
                     self.keyboardMonitor.start()
-                    // Reset all transient state — user may have typed in another
-                    // app or moved the cursor while TypeBoost was disabled, so
-                    // pre-disable context, prediction mode, and cursor cache are stale.
+                    // Full state reset — user may have typed elsewhere or moved
+                    // the cursor while TypeBoost was disabled.
                     self.contextManager.reset()
                     self.predictionEngine.reset()
                     self.cancelNextWordMode()
+                    self.predictionMode = .prefixCompletion   // cancelNextWordMode only covers .nextWord
+                    self.arrowKeyDebounceTimer?.invalidate()  // prevent stale timer firing in new context
+                    self.arrowKeyDebounceTimer = nil
+                    self.staticPollCount = 0                  // reset poll back-off
                     TextInserter.invalidateCursorCache()
+                    TextInserter.lastClickPosition = nil      // clear browser Strategy-2 anchor
+                    TextInserter.lastKnownMousePosition = nil
                 } else {
                     self.keyboardMonitor.stop()
                     self.suggestionWindow.hide()
