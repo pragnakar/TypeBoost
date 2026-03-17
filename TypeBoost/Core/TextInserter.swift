@@ -340,10 +340,12 @@ enum TextInserter {
 
     // MARK: – Strategy 1: AX Caret Bounds (works in native apps)
 
-    private static func strategy1_axCaretBounds() -> NSRect? {
+    /// Full AX caret bounds query with a configurable timeout.
+    /// Default 0.1s is appropriate for background calls (asyncRepositionBar).
+    /// Pass 0.02s for cold-start fast path (fastCursorRect) on the main thread.
+    private static func strategy1_axCaretBounds(timeout: Float = 0.1) -> NSRect? {
         let systemWide = AXUIElementCreateSystemWide()
-        // Fail fast — don't block the main thread waiting for a slow AX server.
-        AXUIElementSetMessagingTimeout(systemWide, 0.1)
+        AXUIElementSetMessagingTimeout(systemWide, timeout)
 
         var focusedRef: AnyObject?
         guard AXUIElementCopyAttributeValue(
@@ -352,7 +354,7 @@ enum TextInserter {
             &focusedRef
         ) == .success, let focusedObj = focusedRef else { return nil }
         let focused = focusedObj as! AXUIElement
-        AXUIElementSetMessagingTimeout(focused, 0.1)
+        AXUIElementSetMessagingTimeout(focused, timeout)
 
         var rangeRef: AnyObject?
         guard AXUIElementCopyAttributeValue(
@@ -386,6 +388,15 @@ enum TextInserter {
               cgRect.origin.y < 10000 else { return nil }
 
         return flipped(cgRect)
+    }
+
+    /// Synchronous AX caret query with a very tight 20ms timeout.
+    /// Used for the cold-start initial bar position (no cached rect) so the bar
+    /// appears in the correct place immediately rather than jumping ~50ms later.
+    /// Returns nil quickly if AX is slow — caller falls back to mouse location.
+    /// Must be called on the main thread.
+    static func fastCursorRect() -> NSRect? {
+        strategy1_axCaretBounds(timeout: 0.02)
     }
 
     // MARK: – Strategy 2: Browser / Electron Window + Click Anchor

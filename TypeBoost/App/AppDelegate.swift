@@ -22,7 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var keyboardMonitor: KeyboardMonitor!
     private var contextManager: ContextManager!
     private var predictionEngine: PredictionEngine!
-    private var suggestionWindow: SuggestionBarWindow!
+    fileprivate var suggestionWindow: SuggestionBarWindow!
     private var menuBarController: MenuBarController!
     private var secureInputDetector: SecureInputDetector!
     private var appIgnoreList: AppIgnoreList!
@@ -49,10 +49,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var repositionPollTimer: Timer?
     /// Time of the last typing keystroke. The poll skips JS/AX when a keystroke
     /// fired recently — the keystroke already triggered asyncRepositionBar().
-    private var lastKeystrokeDate: Date = .distantPast
+    var lastKeystrokeDate: Date = .distantPast
     /// Consecutive poll ticks where the bar didn't move. After 3 static ticks
     /// the poll interval backs off to 1s to reduce WindowServer compositing work.
-    private var staticPollCount: Int = 0
+    var staticPollCount: Int = 0
+
+    // MARK: – AXObserver (instant cursor tracking without polling)
+
+    /// Active AXObserver for the frontmost application.
+    /// Delivers kAXSelectedTextChangedNotification immediately when the cursor
+    /// moves — arrow keys, mouse selection, IME — without waiting for the poll.
+    private var axObserver: AXObserver?
+    private var axObserverPID: pid_t = 0
+    /// The focused element currently observed for selectedTextChanged.
+    fileprivate var axFocusedElement: AXUIElement?
+
+    // MARK: – Scroll throttle
+
+    /// Last time a scroll event triggered asyncRepositionBar().
+    /// Scroll fires at 50–100Hz; we reposition at most once per 100ms.
+    private var lastScrollDate: Date = .distantPast
 
     // MARK: – Lifecycle
 
@@ -183,6 +199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        teardownAXObserver()
         keyboardMonitor.stop()
         predictionEngine.saveBigramModel()
         settings.save()
@@ -376,6 +393,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 insertSuggestion(word)
             }
 
+        case .scroll:
+            // Scroll fires at 50–100Hz — apply 100ms throttle so we only fire
+            // one reposition per continuous scroll gesture, not one per event.
+            guard suggestionWindow.isVisible else { return }
+            let now = Date()
+            guard now.timeIntervalSince(lastScrollDate) > 0.1 else { return }
+            lastScrollDate = now
+            asyncRepositionBar(fromPoll: true)
+
         case .mouseUp:
             // User clicked — cursor moved to a new position. Invalidate the
             // position cache and reset shadow typing state so stale context
@@ -405,7 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   on large jumps (> 150pt) — preventing the bar teleporting to a stale position
     ///   after the user drags a window. Keystroke-triggered calls pass false and always
     ///   reposition unconditionally.
-    private func asyncRepositionBar(fromPoll: Bool = false) {
+    fileprivate func asyncRepositionBar(fromPoll: Bool = false) {
         Task { [weak self] in
             guard let self else { return }
             let bundleID = await MainActor.run {
@@ -489,11 +515,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Show instantly at the best available cached position so the bar
-        // appears with zero latency, then fire an async AX query to reposition
-        // accurately. This runs on the main actor but deferred, so the current
-        // keystroke handler returns before the AX call blocks.
+        // Show instantly at the best available position so the bar appears
+        // with zero perceived latency. Priority:
+        //   1. Nudge-tracked cached rect  — most recent, no AX call needed
+        //   2. fastCursorRect()           — tight 20ms AX call, correct on cold-start
+        //   3. Mouse location             — last resort, asyncRepositionBar() corrects it
         let instantRect = TextInserter.trackedCursorRect()
+            ?? TextInserter.fastCursorRect()
             ?? NSRect(x: NSEvent.mouseLocation.x, y: NSEvent.mouseLocation.y, width: 2, height: 16)
         #if DEBUG
         NSLog("[TypeBoost] generateAndShow: instantRect=\(instantRect)")
@@ -564,6 +592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let cursorRect = TextInserter.trackedCursorRect()
+            ?? TextInserter.fastCursorRect()
             ?? NSRect(x: NSEvent.mouseLocation.x, y: NSEvent.mouseLocation.y, width: 2, height: 16)
         suggestionWindow.show(
             suggestions: instantSuggestions,
@@ -643,6 +672,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         predictionMode = .spellCorrection
         let cursorRect = TextInserter.trackedCursorRect()
+            ?? TextInserter.fastCursorRect()
             ?? NSRect(x: NSEvent.mouseLocation.x, y: NSEvent.mouseLocation.y, width: 2, height: 16)
         suggestionWindow.show(
             suggestions: suggestions,
@@ -651,6 +681,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         asyncRepositionBar()
         startRepositionPolling()
+    }
+
+    // MARK: – AXObserver Management
+
+    /// Creates an AXObserver for the given PID and registers for focus-change
+    /// notifications on the app element, then immediately observes the currently
+    /// focused element for selectedText changes.
+    private func setupAXObserver(pid: pid_t) {
+        teardownAXObserver()
+        guard pid > 0 else { return }
+
+        var obs: AXObserver?
+        guard AXObserverCreate(pid, axObserverCallbackFn, &obs) == .success,
+              let observer = obs else { return }
+
+        axObserver = observer
+        axObserverPID = pid
+
+        let appElement = AXUIElementCreateApplication(pid)
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        // Track focus changes so we re-register on the newly focused element.
+        AXObserverAddNotification(observer, appElement,
+            kAXFocusedUIElementChangedNotification as CFString, selfPtr)
+
+        // Deliver notifications on the main RunLoop.
+        CFRunLoopAddSource(CFRunLoopGetMain(),
+            AXObserverGetRunLoopSource(observer), .defaultMode)
+
+        // Register on the element that's currently focused.
+        updateAXFocusedElement()
+    }
+
+    /// Re-registers kAXSelectedTextChangedNotification on the currently focused
+    /// element after a focus change. Called from the AXObserver C callback.
+    fileprivate func updateAXFocusedElement() {
+        guard let observer = axObserver, axObserverPID > 0 else { return }
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        // Remove notification from previous element.
+        if let old = axFocusedElement {
+            AXObserverRemoveNotification(observer, old,
+                kAXSelectedTextChangedNotification as CFString)
+        }
+
+        // Get the newly focused element.
+        let appElement = AXUIElementCreateApplication(axObserverPID)
+        var focusedRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(appElement,
+            kAXFocusedUIElementAttribute as CFString, &focusedRef) == .success,
+              let focusedObj = focusedRef else {
+            axFocusedElement = nil
+            return
+        }
+        let focused = focusedObj as! AXUIElement
+        axFocusedElement = focused
+
+        // kAXSelectedTextChangedNotification fires when the caret moves:
+        // arrow keys, mouse click, Home/End, Cmd+A, etc.
+        AXObserverAddNotification(observer, focused,
+            kAXSelectedTextChangedNotification as CFString, selfPtr)
+    }
+
+    private func teardownAXObserver() {
+        guard let observer = axObserver else { return }
+        let source = AXObserverGetRunLoopSource(observer)
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+        if let element = axFocusedElement {
+            AXObserverRemoveNotification(observer, element,
+                kAXSelectedTextChangedNotification as CFString)
+        }
+        axObserver = nil
+        axObserverPID = 0
+        axFocusedElement = nil
     }
 
     // MARK: – App Switching
@@ -677,6 +781,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         arrowKeyDebounceTimer?.invalidate()
         arrowKeyDebounceTimer = nil
 
+        // Re-register AXObserver for the new app so cursor moves are tracked instantly.
+        if let pid = (notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+            as? NSRunningApplication)?.processIdentifier {
+            setupAXObserver(pid: pid)
+        }
+
         // Reset cursor position tracking so stale coordinates from the
         // previous app don't pollute the new one.
         TextInserter.lastClickPosition = nil
@@ -689,5 +799,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         cancelNextWordMode()
         predictionMode = .prefixCompletion
         suggestionWindow.hide()
+    }
+}
+
+// MARK: – AXObserver C Callback
+
+/// File-scope C function required by AXObserverCreate.
+/// The observer's RunLoop source is added to the main RunLoop in setupAXObserver,
+/// so this callback is always delivered on the main thread — no dispatch needed.
+private func axObserverCallbackFn(
+    _ observer: AXObserver,
+    _ element: AXUIElement,
+    _ notification: CFString,
+    _ refcon: UnsafeMutableRawPointer?
+) {
+    guard let refcon else { return }
+    let delegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+
+    switch notification as String {
+    case kAXFocusedUIElementChangedNotification:
+        // Text field focus changed — re-register selectedTextChanged on the new element.
+        delegate.updateAXFocusedElement()
+
+    case kAXSelectedTextChangedNotification:
+        // Caret moved (arrow key, mouse drag, Home/End, etc.).
+        // Skip if the bar isn't visible or if a keystroke just fired — the
+        // keystroke path already triggered asyncRepositionBar().
+        guard delegate.suggestionWindow.isVisible else { return }
+        guard Date().timeIntervalSince(delegate.lastKeystrokeDate) > 0.15 else { return }
+        delegate.asyncRepositionBar()
+
+    default:
+        break
     }
 }

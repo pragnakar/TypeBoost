@@ -368,6 +368,25 @@ Complete history of all development work performed across all sessions.
 
 ---
 
+## Session 9: AXObserver, Scroll Repositioning, Cold-Start Fix
+
+### 57. AXObserver for Instant Cursor Tracking (`AppDelegate.swift`)
+- **Problem**: Cursor moves from arrow keys, mouse drag-selection, IME, Home/End were only tracked by the 300ms poll — creating visible lag between cursor position and bar position.
+- **Fix**: Added `setupAXObserver(pid:)` / `teardownAXObserver()` / `updateAXFocusedElement()` methods and file-scope C callback `axObserverCallbackFn`. Registers `kAXFocusedUIElementChangedNotification` on the app element and `kAXSelectedTextChangedNotification` on the currently focused text field. On `selectedTextChanged`, calls `asyncRepositionBar()` unless a keystroke fired in the last 150ms (keystroke path already handles it). Observer is set up on `handleAppSwitch` and torn down on `applicationWillTerminate`.
+
+### 58. Scroll Repositioning (`KeyboardMonitor.swift`, `AppDelegate.swift`)
+- **Problem**: Scrolling in a document (e.g. in a browser or code editor) moved the text under the cursor without triggering any keystroke event, leaving the bar stranded at a stale position.
+- **Fix**: Added `.scroll` to `KeyboardEvent` enum and `.scrollWheel` to the CGEventMask. In `handleKeyEvent`, a 100ms throttle gate fires `asyncRepositionBar(fromPoll: true)` once per scroll gesture.
+
+### 59. Cold-Start Position Fix (`AppDelegate.swift`, `TextInserter.swift`)
+- **Problem**: On the first keystroke after cache invalidation, `TextInserter.trackedCursorRect()` returns nil, so the bar appeared at mouse location — then jumped ~50ms later when `asyncRepositionBar()` returned the true position.
+- **Fix**: Added `fastCursorRect()` (20ms AX timeout via `strategy1_axCaretBounds(timeout: 0.02)`). All three show sites (`generateAndShowSuggestions`, `generateNextWordSuggestions`, `checkWordUnderCursor`) now use the chain: `trackedCursorRect() ?? fastCursorRect() ?? mouseLocation`. Eliminates the jump on cold-start.
+
+### 60. AXObserver C Callback (`AppDelegate.swift`)
+- Added file-scope `axObserverCallbackFn` required by `AXObserverCreate`. Runs on the main RunLoop (delivered synchronously on main thread). Routes `kAXFocusedUIElementChangedNotification` to `updateAXFocusedElement()` and `kAXSelectedTextChangedNotification` to `asyncRepositionBar()` with a 150ms keystroke-recency guard.
+
+---
+
 ## Build & Test Status
 
 - **Build**: Successful (0 errors, 0 warnings)

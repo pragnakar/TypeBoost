@@ -32,6 +32,8 @@ enum KeyboardEvent {
     case numberSelect(Int)
     /// Mouse click released — user may have clicked on a word.
     case mouseUp
+    /// Scroll wheel / trackpad scroll — bar may need repositioning.
+    case scroll
     case other
 }
 
@@ -111,6 +113,7 @@ final class KeyboardMonitor {
                               | (1 << CGEventType.flagsChanged.rawValue)
                               | (1 << CGEventType.leftMouseDown.rawValue)
                               | (1 << CGEventType.leftMouseUp.rawValue)
+                              | (1 << CGEventType.scrollWheel.rawValue)
 
         // Store `self` as a raw pointer so the C callback can reach us.
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -247,6 +250,16 @@ private func keyboardTapCallback(
     if type == .leftMouseUp {
         DispatchQueue.main.async {
             monitor.onKeyEvent?(.mouseUp)
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    // On scroll, dispatch a throttled reposition signal.
+    // Scroll fires at 50–100Hz on trackpad — AppDelegate applies a 100ms guard
+    // so only one reposition fires per scroll gesture, not one per event.
+    if type == .scrollWheel {
+        DispatchQueue.main.async {
+            monitor.onKeyEvent?(.scroll)
         }
         return Unmanaged.passUnretained(event)
     }
