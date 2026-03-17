@@ -55,8 +55,31 @@ final class ContextManager {
     }
 
     /// Remove the last character (backspace).
+    ///
+    /// When `currentWord` is empty, the user is backspacing past a word
+    /// boundary — deleting the space/punctuation that follows the previous
+    /// word. We "reopen" that word by popping it from `previousWords` back
+    /// into `currentWord`. The on-screen deletion handles itself (the
+    /// backspace event passes through to the target app); we just need to
+    /// keep the shadow state in sync.
+    ///
+    /// Example: user accepted "hippopotamus " via suggestion →
+    ///   currentWord = "", previousWords = [..., "hippopotamus"]
+    /// First backspace deletes the trailing space:
+    ///   currentWord = "hippopotamus" (reopened), previousWords shrinks by 1
+    /// Second backspace deletes "s":
+    ///   currentWord = "hippopotamu"
     func deleteLastCharacter() {
-        guard !currentWord.isEmpty else { return }
+        if currentWord.isEmpty {
+            // Backspacing past a word boundary — reopen the previous word.
+            // The on-screen backspace deletes the space/punctuation separator;
+            // the word itself is now editable again.
+            if let lastWord = previousWords.popLast() {
+                currentWord = lastWord
+                isCancelled = false
+            }
+            return
+        }
         currentWord.removeLast()
         // If the entire word is deleted, treat the next input as a new word.
         if currentWord.isEmpty {

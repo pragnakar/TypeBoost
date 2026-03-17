@@ -48,6 +48,12 @@ final class BigramModel {
     /// Observations since last save. Used to trigger periodic persistence.
     private var observationsSinceLastSave: Int = 0
 
+    /// Observations since the last eviction sort (separate counters per model).
+    /// Eviction is O(n log n) on 5000 keys — only worth running every N adds.
+    private var bigramObservationsSinceEviction: Int = 0
+    private var trigramObservationsSinceEviction: Int = 0
+    private let evictionCheckInterval = 500
+
     /// Called when the model should be persisted (every 100 observations).
     var onNeedsSave: (() -> Void)?
 
@@ -220,6 +226,9 @@ final class BigramModel {
     /// Removes the stalest bigram context keys when the cap is exceeded.
     /// Prefers evicting keys with the oldest lastSeen dates.
     private func evictBigramsIfNeeded() {
+        bigramObservationsSinceEviction += 1
+        guard bigramObservationsSinceEviction >= evictionCheckInterval else { return }
+        bigramObservationsSinceEviction = 0
         guard bigrams.count > maxContextKeys else { return }
         // Find the oldest lastSeen per context key.
         let keysWithAge: [(key: String, oldestSeen: Date)] = bigrams.map { key, nexts in
@@ -236,6 +245,9 @@ final class BigramModel {
 
     /// Removes the stalest trigram context keys when the cap is exceeded.
     private func evictTrigramsIfNeeded() {
+        trigramObservationsSinceEviction += 1
+        guard trigramObservationsSinceEviction >= evictionCheckInterval else { return }
+        trigramObservationsSinceEviction = 0
         guard trigrams.count > maxContextKeys else { return }
         let keysWithAge: [(key: String, oldestSeen: Date)] = trigrams.map { key, nexts in
             let oldest = nexts.values.map(\.lastSeen).min() ?? .distantPast

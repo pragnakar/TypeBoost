@@ -210,6 +210,14 @@ final class SuggestionBarWindow: NSPanel {
         }
     }
 
+    /// Reposition the bar near a new cursor rect without changing suggestions.
+    /// Used by the async AX query that fires after every keystroke to keep
+    /// the bar accurately anchored even when AX is slow.
+    func reposition(near cursorRect: NSRect) {
+        guard self.isVisible else { return }
+        positionPanel(near: cursorRect)
+    }
+
     /// Hide the suggestion bar with a fade.
     func hide() {
         guard self.isVisible else { return }

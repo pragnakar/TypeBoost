@@ -43,6 +43,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var arrowKeyDebounceTimer: Timer?
     /// Auto-dismiss timer for next-word suggestions.
     private var nextWordDismissTimer: Timer?
+    /// Repeating timer that re-anchors the bar position while it's visible.
+    /// Fires every 300ms so the bar tracks the cursor even without a keystroke
+    /// (e.g. after scrolling, browser layout reflow, auto-indent).
+    private var repositionPollTimer: Timer?
+    /// Time of the last typing keystroke. The poll skips JS/AX when a keystroke
+    /// fired recently — the keystroke already triggered asyncRepositionBar().
+    private var lastKeystrokeDate: Date = .distantPast
 
     // MARK: – Lifecycle
 
@@ -161,6 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch event {
         case .character(let char):
+            lastKeystrokeDate = Date()
             // Digits are handled by .numberSelect when suggestions are visible.
             // If we receive a digit here, suggestions must be hidden — just reset.
             if char.isNumber {
@@ -186,17 +194,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             predictionMode = .prefixCompletion
             contextManager.appendCharacter(char)
+            // Nudge the cached cursor position rightward so the suggestion
+            // bar tracks horizontally even if the next AX call fails.
+            TextInserter.nudgeCachedPosition(by: 1)
             #if DEBUG
             NSLog("[TypeBoost] character '\(char)' → currentWord='\(contextManager.currentWord)'")
             #endif
             generateAndShowSuggestions()
 
         case .backspace:
+            lastKeystrokeDate = Date()
             if predictionMode == .nextWord {
                 cancelNextWordMode()
                 suggestionWindow.hide()
             }
             predictionMode = .prefixCompletion
+            TextInserter.nudgeCachedPosition(by: -1)
             contextManager.deleteLastCharacter()
             if contextManager.currentWord.isEmpty {
                 suggestionWindow.hide()
@@ -205,6 +218,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case .space, .punctuation:
+            lastKeystrokeDate = Date()
+            // Space/punctuation nudge the cursor forward by 1 character.
+            TextInserter.nudgeCachedPosition(by: 1)
             let completedWord = contextManager.currentWord
             let previousWords = contextManager.typingContext.previousWords
 
@@ -287,6 +303,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if suggestionWindow.isSelectionActive,
                let selected = suggestionWindow.acceptSelection() {
                 insertSuggestion(selected)
+            } else {
+                // Line break — nudge bar down by one line height, commit word, hide bar.
+                TextInserter.nudgeCachedPositionForNewLine()
+                if !contextManager.currentWord.isEmpty {
+                    predictionEngine.recordManualEntry(contextManager.currentWord)
+                }
+                contextManager.commitCurrentWord()
+                cancelNextWordMode()
+                suggestionWindow.hide()
             }
 
         case .numberSelect(let n):
@@ -297,13 +322,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case .mouseUp:
-            // User clicked — check for misspelled word after a short delay.
+            // User clicked — cursor moved to a new position. Invalidate the
+            // position cache and reset shadow typing state so stale context
+            // from before the click doesn't produce wrong suggestions.
+            TextInserter.invalidateCursorCache()
+            contextManager.reset()
+            cancelNextWordMode()
+            suggestionWindow.hide()
+            // Check for misspelled word after a short delay.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
                 self?.checkWordUnderCursor()
             }
 
         case .other:
             break
+        }
+    }
+
+    // MARK: – Async Bar Reposition
+
+    /// Fire-and-forget: queries the accurate cursor position (JS injection for browsers,
+    /// AX for native apps) on a background thread and repositions the bar when done.
+    /// Safe to call on every keystroke — the task is cheap if JS is unavailable (AX only).
+    private func asyncRepositionBar() {
+        Task { [weak self] in
+            guard let self else { return }
+            let bundleID = await MainActor.run {
+                NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+            }
+            let rect = await TextInserter.accurateCursorRect(bundleID: bundleID)
+            await MainActor.run { [weak self] in
+                guard let self, self.suggestionWindow.isVisible else { return }
+                self.suggestionWindow.reposition(near: rect)
+            }
+        }
+    }
+
+    /// Start (or restart) the 300ms re-anchor poll. The timer self-cancels when
+    /// the bar hides, so there is no need to explicitly stop it on every hide path.
+    private func startRepositionPolling() {
+        repositionPollTimer?.invalidate()
+        repositionPollTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+            guard let self, self.suggestionWindow.isVisible else {
+                self?.repositionPollTimer?.invalidate()
+                self?.repositionPollTimer = nil
+                return
+            }
+            // Skip when a keystroke fired recently — it already triggered asyncRepositionBar().
+            // The poll's value is catching position changes between keystrokes (scroll, reflow).
+            guard Date().timeIntervalSince(self.lastKeystrokeDate) > 0.2 else { return }
+            self.asyncRepositionBar()
         }
     }
 
@@ -334,15 +402,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let cursorRect = TextInserter.cursorRect()
+        // Show instantly at the best available cached position so the bar
+        // appears with zero latency, then fire an async AX query to reposition
+        // accurately. This runs on the main actor but deferred, so the current
+        // keystroke handler returns before the AX call blocks.
+        let instantRect = TextInserter.trackedCursorRect()
+            ?? NSRect(x: NSEvent.mouseLocation.x, y: NSEvent.mouseLocation.y, width: 2, height: 16)
         #if DEBUG
-        NSLog("[TypeBoost] generateAndShow: cursorRect=\(cursorRect)")
+        NSLog("[TypeBoost] generateAndShow: instantRect=\(instantRect)")
         #endif
         suggestionWindow.show(
             suggestions: suggestions,
-            near: cursorRect,
+            near: instantRect,
             activateSelection: activateSelection
         )
+        asyncRepositionBar()
+        startRepositionPolling()
     }
 
     // MARK: – Text Insertion
@@ -377,6 +452,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // After inserting a suggestion the cursor has jumped — invalidate
+        // the cached position so the next AX query gets a fresh read.
+        TextInserter.invalidateCursorCache()
         predictionMode = .prefixCompletion
         suggestionWindow.hide()
     }
@@ -396,13 +474,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let cursorRect = TextInserter.cursorRect()
+        let cursorRect = TextInserter.trackedCursorRect()
+            ?? NSRect(x: NSEvent.mouseLocation.x, y: NSEvent.mouseLocation.y, width: 2, height: 16)
         suggestionWindow.show(
             suggestions: instantSuggestions,
             near: cursorRect,
             activateSelection: false,
             mode: .nextWord
         )
+        asyncRepositionBar()
+        startRepositionPolling()
 
         // Fire async Foundation Models request for better suggestions.
         predictionEngine.predictNextWordAsync(context: context) { [weak self] aiSuggestions in
@@ -410,9 +491,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   self.predictionMode == .nextWord,
                   !aiSuggestions.isEmpty,
                   self.suggestionWindow.isVisible else { return }
+            // Use tracked position — cursor hasn't moved since the bar appeared.
+            let rect = TextInserter.trackedCursorRect() ?? TextInserter.cursorRect()
             self.suggestionWindow.update(
                 suggestions: aiSuggestions,
-                near: TextInserter.cursorRect()
+                near: rect
             )
         }
 
@@ -470,12 +553,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         predictionMode = .spellCorrection
-        let cursorRect = TextInserter.cursorRect()
+        let cursorRect = TextInserter.trackedCursorRect()
+            ?? NSRect(x: NSEvent.mouseLocation.x, y: NSEvent.mouseLocation.y, width: 2, height: 16)
         suggestionWindow.show(
             suggestions: suggestions,
             near: cursorRect,
             mode: .spellCorrection
         )
+        asyncRepositionBar()
+        startRepositionPolling()
     }
 
     // MARK: – App Switching
