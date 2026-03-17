@@ -571,6 +571,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             predictionEngine.recordAcceptance(suggestion)
             contextManager.acceptSuggestion(suggestion.word)
             cancelNextWordMode()
+            // Chain: immediately show next-word predictions for the word just inserted.
+            // The context now includes this word as the last previous word, so the
+            // bigram model can suggest what typically follows it.
+            TextInserter.invalidateCursorCache()
+            predictionMode = .nextWord
+            generateNextWordSuggestions()
+            return  // skip the hide() + prefixCompletion reset below
 
         case .prefixCompletion:
             // Replace the partial prefix.
