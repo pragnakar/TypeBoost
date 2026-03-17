@@ -29,7 +29,7 @@ final class SuggestionBarView: NSVisualEffectView {
 
     private func commonInit() {
         self.material = .popover
-        self.blendingMode = .behindWindow
+        self.blendingMode = .withinWindow
         self.state = .active
         self.wantsLayer = true
         self.layer?.cornerRadius = 8
@@ -120,7 +120,11 @@ final class SuggestionBarView: NSVisualEffectView {
         // "layoutSubtreeIfNeeded on a view which is already being laid out" warning.
         // Deferring breaks the re-entrancy without any visible delay.
         guard let window = self.window, window.frame.size != newSize else { return }
+        // Re-check size inside the async block — a previous deferred call may have
+        // already applied the same size, and calling setContentSize twice creates
+        // redundant IOSurface backing stores that accumulate in WindowServer.
         DispatchQueue.main.async { [weak window, newSize] in
+            guard window?.frame.size != newSize else { return }
             window?.setContentSize(newSize)
         }
     }

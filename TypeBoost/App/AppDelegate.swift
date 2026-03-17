@@ -50,6 +50,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Time of the last typing keystroke. The poll skips JS/AX when a keystroke
     /// fired recently — the keystroke already triggered asyncRepositionBar().
     private var lastKeystrokeDate: Date = .distantPast
+    /// Consecutive poll ticks where the bar didn't move. After 3 static ticks
+    /// the poll interval backs off to 1s to reduce WindowServer compositing work.
+    private var staticPollCount: Int = 0
 
     // MARK: – Lifecycle
 
@@ -375,20 +378,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Start (or restart) the 300ms re-anchor poll. The timer self-cancels when
-    /// the bar hides, so there is no need to explicitly stop it on every hide path.
+    /// Start (or restart) the re-anchor poll. Fires at 300ms while the bar is
+    /// actively moving; backs off to 1s after 3 consecutive static ticks to
+    /// reduce WindowServer compositing load when the bar is idle.
+    /// The timer self-cancels when the bar hides.
     private func startRepositionPolling() {
         repositionPollTimer?.invalidate()
-        repositionPollTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+        staticPollCount = 0
+        scheduleNextPoll()
+    }
+
+    private func scheduleNextPoll() {
+        // 300ms while moving; 1s once the bar has been static for 3+ ticks.
+        let interval: TimeInterval = staticPollCount >= 3 ? 1.0 : 0.3
+        repositionPollTimer?.invalidate()
+        repositionPollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             guard let self, self.suggestionWindow.isVisible else {
                 self?.repositionPollTimer?.invalidate()
                 self?.repositionPollTimer = nil
                 return
             }
             // Skip when a keystroke fired recently — it already triggered asyncRepositionBar().
-            // The poll's value is catching position changes between keystrokes (scroll, reflow).
-            guard Date().timeIntervalSince(self.lastKeystrokeDate) > 0.2 else { return }
+            guard Date().timeIntervalSince(self.lastKeystrokeDate) > 0.2 else {
+                // A keystroke just fired — reset static count and stay at 300ms.
+                self.staticPollCount = 0
+                self.scheduleNextPoll()
+                return
+            }
+            let prevOrigin = self.suggestionWindow.frame.origin
             self.asyncRepositionBar(fromPoll: true)
+            // Check after a short settle whether the bar actually moved.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self else { return }
+                let moved = self.suggestionWindow.frame.origin != prevOrigin
+                self.staticPollCount = moved ? 0 : self.staticPollCount + 1
+                self.scheduleNextPoll()
+            }
         }
     }
 
@@ -434,6 +459,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             activateSelection: activateSelection
         )
         asyncRepositionBar()
+        // Reset static count so poll stays at 300ms while typing.
+        staticPollCount = 0
         startRepositionPolling()
     }
 

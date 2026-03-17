@@ -348,6 +348,26 @@ Complete history of all development work performed across all sessions.
 
 ---
 
+## Session 8: WindowServer Compositing Optimisation
+
+### 53. Guard `setFrameOrigin` Against No-Op Calls (`SuggestionBarWindow.swift`)
+- **Problem**: `positionPanel` called `setFrameOrigin` even when the bar hadn't moved (distance = 0). On a transparent/visual-effect window this always triggers a WindowServer compositing pass — even with the same origin — generating ~200 no-op IPC calls per minute from the 300ms poll.
+- **Fix**: Added `guard distance > 0.5 else { return }` before the animate/snap branch. Eliminates all compositing work when the bar is stationary.
+
+### 54. Poll Back-Off When Bar Is Static (`AppDelegate.swift`)
+- **Problem**: The 300ms poll fired at a constant rate regardless of whether the bar was actually moving, generating unnecessary WindowServer work during idle periods.
+- **Fix**: Replaced the repeating `Timer` with `scheduleNextPoll()` — a one-shot timer that reschedules itself. After 3 consecutive ticks where the bar didn't move (`staticPollCount >= 3`), interval backs off to 1s. Resets to 300ms immediately on any keystroke or position change.
+
+### 55. `setContentSize` Race Fix (`SuggestionBarView.swift`)
+- **Problem**: `resizeWindowToFitContent()` checked `window.frame.size != newSize` before dispatching async, but a previous deferred call may have already applied the same size. The stale check let duplicate `setContentSize` calls through, each creating a new IOSurface backing store in WindowServer — the primary cause of gradual memory growth.
+- **Fix**: Added a second size check inside the `DispatchQueue.main.async` block to discard redundant calls.
+
+### 56. Switch `NSVisualEffectView` to `.withinWindow` Blending (`SuggestionBarView.swift`)
+- **Problem**: `.behindWindow` blending requires WindowServer to maintain a live composited snapshot of everything behind the bar for the blur effect. On every bar move, WindowServer re-samples the content at the new position — the most expensive compositing mode on macOS.
+- **Fix**: Changed `blendingMode` from `.behindWindow` to `.withinWindow`. The visual appearance is nearly identical for a floating panel; WindowServer no longer needs to track behind-window content.
+
+---
+
 ## Build & Test Status
 
 - **Build**: Successful (0 errors, 0 warnings)

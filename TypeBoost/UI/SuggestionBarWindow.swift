@@ -169,11 +169,17 @@ final class SuggestionBarWindow: NSPanel {
         origin.x = max(visibleFrame.minX, min(origin.x, visibleFrame.maxX - panelSize.width))
         origin.y = max(visibleFrame.minY + 4, min(origin.y, visibleFrame.maxY - panelSize.height - 4))
 
-        // Animate small moves (same-line typing); snap for large jumps or first appearance.
+        // Skip the WindowServer IPC entirely if the position hasn't changed.
+        // setFrameOrigin on a transparent/visual-effect window always triggers a
+        // compositing pass — even when called with the same origin — so this guard
+        // is necessary to prevent the 300ms poll from generating a constant stream
+        // of no-op compositing work.
         let currentOrigin = self.frame.origin
         let distance = hypot(origin.x - currentOrigin.x, origin.y - currentOrigin.y)
+        guard distance > 0.5 else { return }
 
-        if self.isVisible && distance < 80 && distance > 0.5 {
+        // Animate small moves (same-line typing); snap for large jumps or first appearance.
+        if self.isVisible && distance < 80 {
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.04
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
