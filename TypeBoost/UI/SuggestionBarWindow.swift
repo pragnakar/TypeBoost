@@ -138,7 +138,7 @@ final class SuggestionBarWindow: NSPanel {
 
     private func positionPanel(near cursorRect: NSRect) {
         let panelSize = self.frame.size
-        let gap: CGFloat = 3  // Tight but clear of the text line.
+        let gap: CGFloat = 1.5  // Tight but clear of the text line.
 
         let targetScreen = NSScreen.screens.first(where: {
             $0.frame.intersects(cursorRect)
@@ -211,10 +211,23 @@ final class SuggestionBarWindow: NSPanel {
     }
 
     /// Reposition the bar near a new cursor rect without changing suggestions.
-    /// Used by the async AX query that fires after every keystroke to keep
-    /// the bar accurately anchored even when AX is slow.
+    /// Used by keystroke-triggered async AX queries — always moves the bar.
     func reposition(near cursorRect: NSRect) {
         guard self.isVisible else { return }
+        positionPanel(near: cursorRect)
+    }
+
+    /// Poll-triggered reposition — applies a large-jump guard.
+    ///
+    /// If the proposed position is > 150pt from the current bar position,
+    /// the user likely dragged the window while the cursor cache was stale.
+    /// In that case hide the bar rather than teleporting it somewhere random.
+    /// Keystroke-triggered repositions bypass this guard via `reposition(near:)`.
+    func repositionIfNearby(near cursorRect: NSRect) {
+        guard self.isVisible else { return }
+        let proposed = NSPoint(x: cursorRect.minX, y: cursorRect.maxY + 1.5)
+        let distance = hypot(proposed.x - frame.origin.x, proposed.y - frame.origin.y)
+        guard distance <= 150 else { hide(); return }
         positionPanel(near: cursorRect)
     }
 

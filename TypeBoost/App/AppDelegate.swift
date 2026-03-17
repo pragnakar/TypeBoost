@@ -119,6 +119,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 if enabled && self.permissionManager.hasRequiredPermissions {
                     self.keyboardMonitor.start()
+                    // Reset all transient state — user may have typed in another
+                    // app or moved the cursor while TypeBoost was disabled, so
+                    // pre-disable context, prediction mode, and cursor cache are stale.
+                    self.contextManager.reset()
+                    self.predictionEngine.reset()
+                    self.cancelNextWordMode()
+                    TextInserter.invalidateCursorCache()
                 } else {
                     self.keyboardMonitor.stop()
                     self.suggestionWindow.hide()
@@ -327,6 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // from before the click doesn't produce wrong suggestions.
             TextInserter.invalidateCursorCache()
             contextManager.reset()
+            predictionEngine.reset()
             cancelNextWordMode()
             suggestionWindow.hide()
             // Check for misspelled word after a short delay.
@@ -344,7 +352,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Fire-and-forget: queries the accurate cursor position (JS injection for browsers,
     /// AX for native apps) on a background thread and repositions the bar when done.
     /// Safe to call on every keystroke — the task is cheap if JS is unavailable (AX only).
-    private func asyncRepositionBar() {
+    ///
+    /// - Parameter fromPoll: When true the bar uses `repositionIfNearby` which hides
+    ///   on large jumps (> 150pt) — preventing the bar teleporting to a stale position
+    ///   after the user drags a window. Keystroke-triggered calls pass false and always
+    ///   reposition unconditionally.
+    private func asyncRepositionBar(fromPoll: Bool = false) {
         Task { [weak self] in
             guard let self else { return }
             let bundleID = await MainActor.run {
@@ -353,7 +366,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let rect = await TextInserter.accurateCursorRect(bundleID: bundleID)
             await MainActor.run { [weak self] in
                 guard let self, self.suggestionWindow.isVisible else { return }
-                self.suggestionWindow.reposition(near: rect)
+                if fromPoll {
+                    self.suggestionWindow.repositionIfNearby(near: rect)
+                } else {
+                    self.suggestionWindow.reposition(near: rect)
+                }
             }
         }
     }
@@ -371,7 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Skip when a keystroke fired recently — it already triggered asyncRepositionBar().
             // The poll's value is catching position changes between keystrokes (scroll, reflow).
             guard Date().timeIntervalSince(self.lastKeystrokeDate) > 0.2 else { return }
-            self.asyncRepositionBar()
+            self.asyncRepositionBar(fromPoll: true)
         }
     }
 
@@ -584,14 +601,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         lastActiveBundleID = newBundleID
 
+        // Cancel arrow-key debounce so it doesn't fire in the new app.
+        arrowKeyDebounceTimer?.invalidate()
+        arrowKeyDebounceTimer = nil
+
         // Reset cursor position tracking so stale coordinates from the
         // previous app don't pollute the new one.
         TextInserter.lastClickPosition = nil
         TextInserter.lastKnownMousePosition = nil
+        TextInserter.invalidateCursorCache()
 
         // Full context reset on genuine app switch.
         contextManager.reset()
+        predictionEngine.reset()
         cancelNextWordMode()
+        predictionMode = .prefixCompletion
         suggestionWindow.hide()
     }
 }

@@ -339,6 +339,13 @@ Complete history of all development work performed across all sessions.
 - `persistJSFailureCount(for:)` helper writes updated count + timestamp to `TypeBoost.jsFailureCount` / `TypeBoost.jsFailureCountDate` keys after every increment and every reset
 - A successful JS call resets count to 0 and persists immediately, so re-enabling the browser setting takes full effect on the next app launch without waiting for the TTL
 
+### 52. Window-Drag Bar Teleport Fix (`AppDelegate.swift`, `SuggestionBarWindow.swift`)
+- **Problem**: Pausing while bar is visible, then dragging the window caused the bar to jump to a random/wrong position. The 300ms poll fires during/after the drag, JS returns `'null'` (focus left the text), AX falls back to the stale position cache, bar repositions to the pre-drag screen coordinates.
+- **Fix**: Distinguished poll-triggered repositions from keystroke-triggered ones via `asyncRepositionBar(fromPoll: Bool)` parameter
+- Added `repositionIfNearby(near:)` to `SuggestionBarWindow`: if the proposed position is > 150pt from the current bar position, **hides** the bar instead of teleporting — normal typing only moves the bar a few pixels per character, so a large jump during polling reliably signals a window move or other stale-cache event
+- Keystroke path (`asyncRepositionBar(fromPoll: false)`) uses `reposition(near:)` unconditionally — corrections from fresh AX/JS calls always apply
+- Poll path (`asyncRepositionBar(fromPoll: true)`) uses `repositionIfNearby(near:)` — hides cleanly on large jumps
+
 ---
 
 ## Build & Test Status
