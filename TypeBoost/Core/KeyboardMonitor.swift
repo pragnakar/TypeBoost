@@ -53,6 +53,10 @@ final class KeyboardMonitor {
     fileprivate var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var tapThread: Thread?
+    /// The CFRunLoop running on the background tap thread.
+    /// Stored at tap-install time so stop() can remove sources and stop
+    /// the RunLoop from the main thread without touching the wrong RunLoop.
+    private var tapRunLoop: CFRunLoop?
     private var isRunning = false
 
     // MARK: – Public
@@ -76,21 +80,33 @@ final class KeyboardMonitor {
         guard isRunning else { return }
         isRunning = false
 
+        // Disable the tap first so no new events are delivered.
         if let tap = eventTap {
             CGEvent.tapEnable(tap: tap, enable: false)
         }
-        if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+
+        // Remove the source from the background thread's RunLoop (not the
+        // main thread's — CFRunLoopGetCurrent() in stop() is the main RunLoop,
+        // which never had this source). Then stop the RunLoop so the background
+        // thread exits cleanly instead of running forever with an orphaned source.
+        if let source = runLoopSource, let runLoop = tapRunLoop {
+            CFRunLoopRemoveSource(runLoop, source, .commonModes)
+            CFRunLoopStop(runLoop)
         }
+
         eventTap = nil
         runLoopSource = nil
-        tapThread?.cancel()
+        tapRunLoop = nil
         tapThread = nil
     }
 
     // MARK: – Private
 
     private func installTap() {
+        // Capture the background thread's RunLoop before anything else so
+        // stop() can target it correctly from the main thread.
+        tapRunLoop = CFRunLoopGetCurrent()
+
         let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
                               | (1 << CGEventType.flagsChanged.rawValue)
                               | (1 << CGEventType.leftMouseDown.rawValue)
