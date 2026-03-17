@@ -50,6 +50,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Time of the last typing keystroke. The poll skips JS/AX when a keystroke
     /// fired recently — the keystroke already triggered asyncRepositionBar().
     var lastKeystrokeDate: Date = .distantPast
+    /// True while the left mouse button is held down (potential window drag).
+    /// All async reposition calls are suppressed during this window to prevent
+    /// the bar from teleporting to stale cached coordinates mid-drag.
+    private var isMouseButtonDown: Bool = false
     /// Consecutive poll ticks where the bar didn't move. After 3 static ticks
     /// the poll interval backs off to 1s to reduce WindowServer compositing work.
     var staticPollCount: Int = 0
@@ -388,7 +392,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         case .numberSelect(let n):
             // Quick-select via plain 1/2/3 when suggestions are visible.
-            guard suggestionWindow.isVisible, (1...3).contains(n) else { return }
+            // Supported in all prediction modes: prefixCompletion, nextWord, spellCorrection.
+            // Use isVisibleAtomic as the authoritative check — the AppKit isVisible property
+            // can lag one run-loop cycle behind the atomic flag on a cold show().
+            guard suggestionWindow.isVisibleAtomic, (1...3).contains(n) else { return }
             if let word = suggestionWindow.suggestion(at: n - 1) {
                 insertSuggestion(word)
             }
@@ -402,7 +409,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastScrollDate = now
             asyncRepositionBar(fromPoll: true)
 
+        case .mouseDown:
+            // Mouse button pressed — may be the start of a window drag.
+            // Suppress async reposition until the button is released so the bar
+            // doesn't teleport to stale cached coordinates mid-drag.
+            isMouseButtonDown = true
+
         case .mouseUp:
+            // Mouse button released — clear drag suppression flag.
+            isMouseButtonDown = false
             // User clicked — cursor moved to a new position. Invalidate the
             // position cache and reset shadow typing state so stale context
             // from before the click doesn't produce wrong suggestions.
@@ -411,8 +426,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             predictionEngine.reset()
             cancelNextWordMode()
             suggestionWindow.hide()
-            // Check for misspelled word after a short delay.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            // Delay long enough for macOS AX to flush the new window geometry
+            // after a potential drag. 50ms was too short — AX could still return
+            // pre-drag coordinates, producing a ghost bar on the first keystroke.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
                 self?.checkWordUnderCursor()
             }
 
@@ -432,6 +449,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   after the user drags a window. Keystroke-triggered calls pass false and always
     ///   reposition unconditionally.
     fileprivate func asyncRepositionBar(fromPoll: Bool = false) {
+        // Suppress all repositioning while mouse button is held — the user may
+        // be dragging the window, and any AX/JS call would return stale geometry,
+        // producing a ghost bar at the old position.
+        guard !isMouseButtonDown else { return }
         Task { [weak self] in
             guard let self else { return }
             let bundleID = await MainActor.run {
@@ -542,8 +563,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func insertSuggestion(_ suggestion: Suggestion) {
         switch predictionMode {
         case .nextWord:
-            // No partial word to delete — just insert at cursor.
-            TextInserter.insertAtCursor(suggestion.word + " ")
+            // No partial word to delete. Use CGEvent keystroke simulation
+            // (replaceCurrent with partialLength 0) rather than insertAtCursor,
+            // which relies on kAXSelectedTextAttribute — only writable in a handful
+            // of apps. CGEvent simulation works universally.
+            TextInserter.replaceCurrent(partialLength: 0, replacement: suggestion.word + " ")
             predictionEngine.recordAcceptance(suggestion)
             contextManager.acceptSuggestion(suggestion.word)
             cancelNextWordMode()
@@ -597,7 +621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         suggestionWindow.show(
             suggestions: instantSuggestions,
             near: cursorRect,
-            activateSelection: false,
+            activateSelection: true,
             mode: .nextWord
         )
         asyncRepositionBar()
@@ -617,10 +641,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
-        // Auto-dismiss after 3 seconds of inactivity.
+        // Auto-dismiss after 8 seconds of inactivity. 3s was too short — users
+        // reading the suggestions and reaching for a number key often missed the window.
         nextWordDismissTimer?.invalidate()
         nextWordDismissTimer = Timer.scheduledTimer(
-            withTimeInterval: 3.0,
+            withTimeInterval: 8.0,
             repeats: false
         ) { [weak self] _ in
             guard self?.predictionMode == .nextWord else { return }

@@ -30,6 +30,8 @@ enum KeyboardEvent {
     case enter
     /// Plain digit (1-3) for quick-select when suggestions are visible.
     case numberSelect(Int)
+    /// Mouse button pressed — user may be starting a window drag.
+    case mouseDown
     /// Mouse click released — user may have clicked on a word.
     case mouseUp
     /// Scroll wheel / trackpad scroll — bar may need repositioning.
@@ -233,6 +235,7 @@ private func keyboardTapCallback(
     }
 
     // Track mouse clicks for cursor positioning in browser/Electron apps.
+    // Also dispatch .mouseDown so AppDelegate can suppress reposition during drags.
     // Convert from AX/CG (top-left origin) to AppKit (bottom-left origin) immediately.
     if type == .leftMouseDown {
         let location = event.location
@@ -241,6 +244,7 @@ private func keyboardTapCallback(
             DispatchQueue.main.async {
                 TextInserter.lastClickPosition = appKitPoint
                 TextInserter.lastKnownMousePosition = appKitPoint
+                monitor.onKeyEvent?(.mouseDown)
             }
         }
         return Unmanaged.passUnretained(event)  // Never consume mouse events

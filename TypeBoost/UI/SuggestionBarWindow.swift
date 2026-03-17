@@ -110,9 +110,12 @@ final class SuggestionBarWindow: NSPanel {
                 self.positionPanel(near: cursorRect)
                 self.applySelectionState(activate: doActivate)
 
+                // Set atomic flag BEFORE orderFrontRegardless so any key event
+                // that fires on the background tap thread during the show animation
+                // sees the bar as visible and emits .numberSelect, not .character.
+                self._atomicVisible.withLock { $0 = true }
                 self.alphaValue = 0
                 self.orderFrontRegardless()
-                self._atomicVisible.withLock { $0 = true }
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = 0.1
                     self.animator().alphaValue = 1.0

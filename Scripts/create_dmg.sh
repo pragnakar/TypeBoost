@@ -7,7 +7,7 @@
 # If no path is given, it looks in the default build output directory.
 #
 # Output:
-#   dist/TypeBoost-1.0.0.dmg
+#   TypeBoost.dmg  (project root)
 #
 # The DMG includes:
 #   • TypeBoost.app
@@ -32,16 +32,14 @@ fi
 # Read version from Info.plist
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Contents/Info.plist" 2>/dev/null || echo "1.0.0")
 
-DIST_DIR="$PROJECT_DIR/dist"
-DMG_NAME="TypeBoost-${VERSION}.dmg"
-DMG_PATH="$DIST_DIR/$DMG_NAME"
+DMG_PATH="$PROJECT_DIR/TypeBoost.dmg"
 STAGING_DIR="$PROJECT_DIR/.dmg-staging"
 
 echo "==> Packaging TypeBoost ${VERSION} into DMG..."
 
 # Clean up previous artifacts.
 rm -rf "$STAGING_DIR" "$DMG_PATH"
-mkdir -p "$STAGING_DIR" "$DIST_DIR"
+mkdir -p "$STAGING_DIR"
 
 # Copy .app to staging.
 echo "    Copying TypeBoost.app..."
