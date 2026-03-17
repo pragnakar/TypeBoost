@@ -114,8 +114,14 @@ final class SuggestionBarView: NSVisualEffectView {
         let totalWidth = pillWidth + separatorWidth + padding * 2 + iconWidth
         let newSize = NSSize(width: max(totalWidth, 80), height: barHeight)
 
-        if let window = self.window, window.frame.size != newSize {
-            window.setContentSize(newSize)
+        // Defer setContentSize to the next run-loop pass.
+        // Calling it synchronously here can trigger a layout pass on the content
+        // view while AppKit is already mid-layout, producing the
+        // "layoutSubtreeIfNeeded on a view which is already being laid out" warning.
+        // Deferring breaks the re-entrancy without any visible delay.
+        guard let window = self.window, window.frame.size != newSize else { return }
+        DispatchQueue.main.async { [weak window, newSize] in
+            window?.setContentSize(newSize)
         }
     }
 

@@ -91,10 +91,12 @@ final class PredictionEngine {
 
         // 2. Adaptive weights: lean on rank early, shift toward context as
         //    bigrams accumulate from actual user typing.
+        //    semanticWeight increased from 0.15 → 0.20 now that Foundation Models
+        //    are disabled — NLEmbedding is the sole generalisation signal above bigrams.
         let maturity = min(1.0, Double(bigramModel.userObservationCount) / 5000.0)
-        let rankWeight     = 0.60 - 0.20 * maturity   // 0.60 → 0.40
+        let rankWeight     = 0.55 - 0.20 * maturity   // 0.55 → 0.35
         let contextWeight  = 0.10 + 0.25 * maturity   // 0.10 → 0.35
-        let semanticWeight = 0.15                      // constant
+        let semanticWeight = 0.20                      // constant (up from 0.15)
         let userWeight     = 0.15                      // constant
 
         let hasSemantic = semanticScorer.isAvailable && !context.previousWords.isEmpty
@@ -139,15 +141,40 @@ final class PredictionEngine {
         var seen = Set<String>()
         let unique = scored.filter { seen.insert($0.word).inserted }
 
-        // 7. Take top N.
-        let results = Array(unique.prefix(maxSuggestions)).map {
-            Suggestion(word: $0.word, score: $0.score)
+        // 7. Take top N, preserving the capitalisation of the typed prefix.
+        //    NSSpellChecker always returns lowercase; if the user typed "He"
+        //    we should show "Hello" not "hello" so accepting the suggestion
+        //    doesn't destroy sentence-start capitalisation.
+        let capitalize = context.currentWord.first?.isUppercase == true
+        let results = Array(unique.prefix(maxSuggestions)).map { item -> Suggestion in
+            let word = capitalize
+                ? item.word.prefix(1).uppercased() + item.word.dropFirst()
+                : item.word
+            return Suggestion(word: word, score: item.score)
         }
 
         // 8. Fire off async Layer 2 request.
         requestLayer2(context: context)
 
         return results
+    }
+
+    // MARK: – Context Reset
+
+    /// Clears the Layer 2 AI cache and resets FM sessions.
+    /// Call whenever typing context is fully reset (app switch, enable toggle, mouse click)
+    /// so stale AI suggestions from a previous context don't bleed into a new one.
+    func reset() {
+        layer2Cache = nil
+        layer2CachePrefix = nil
+        layer2Task?.cancel()
+        layer2Task = nil
+        nextWordTask?.cancel()
+        nextWordTask = nil
+        // resetSessions() is async (actor-isolated on FoundationModelEngine).
+        // Fire-and-forget is safe here — the tasks above are already cancelled
+        // so no new FM calls will start before the reset completes.
+        Task { await contextualProvider.resetSessions() }
     }
 
     // MARK: – Spell Check
@@ -202,13 +229,15 @@ final class PredictionEngine {
         }
 
         // 5. Apply semantic scoring bonus.
+        //    Coefficient raised from 0.25 → 0.35 now that FM is disabled —
+        //    NLEmbedding is the primary generalisation signal for next-word prediction.
         if semanticScorer.isAvailable {
             for word in scores.keys {
                 let semScore = semanticScorer.score(
                     candidate: word,
                     contextWords: context.previousWords
                 )
-                scores[word]! += semScore * 0.25
+                scores[word]! += semScore * 0.35
             }
         }
 

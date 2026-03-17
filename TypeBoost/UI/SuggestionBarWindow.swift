@@ -138,7 +138,7 @@ final class SuggestionBarWindow: NSPanel {
 
     private func positionPanel(near cursorRect: NSRect) {
         let panelSize = self.frame.size
-        let gap: CGFloat = 1.5  // Tight but clear of the text line.
+        let gap: CGFloat = 2  // Tight but clear of the text line.
 
         let targetScreen = NSScreen.screens.first(where: {
             $0.frame.intersects(cursorRect)
@@ -225,7 +225,7 @@ final class SuggestionBarWindow: NSPanel {
     /// Keystroke-triggered repositions bypass this guard via `reposition(near:)`.
     func repositionIfNearby(near cursorRect: NSRect) {
         guard self.isVisible else { return }
-        let proposed = NSPoint(x: cursorRect.minX, y: cursorRect.maxY + 1.5)
+        let proposed = NSPoint(x: cursorRect.minX, y: cursorRect.maxY + 2)
         let distance = hypot(proposed.x - frame.origin.x, proposed.y - frame.origin.y)
         guard distance <= 150 else { hide(); return }
         positionPanel(near: cursorRect)
