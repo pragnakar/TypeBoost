@@ -87,6 +87,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("[TypeBoost] MenuBarController created")
         #endif
 
+        menuBarController.onResetLearning = { [weak self] in
+            self?.predictionEngine.resetAllLearning()
+        }
+
         keyboardMonitor = KeyboardMonitor()
 
         bindEvents()

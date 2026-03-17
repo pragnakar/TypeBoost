@@ -131,6 +131,22 @@ final class BigramModel {
         return bigramScore
     }
 
+    // MARK: – Reset
+
+    /// Clears all learned bigram/trigram data and re-seeds with defaults.
+    /// Called by PredictionEngine.resetAllLearning() when the user resets learned data.
+    func reset() {
+        bigrams.removeAll()
+        trigrams.removeAll()
+        bigramTotals.removeAll()
+        trigramTotals.removeAll()
+        userObservationCount = 0
+        observationsSinceLastSave = 0
+        bigramObservationsSinceEviction = 0
+        trigramObservationsSinceEviction = 0
+        seedDefaults()
+    }
+
     // MARK: – Seeding
 
     /// Seed the model with common English word pairs.

@@ -159,6 +159,24 @@ final class PredictionEngine {
         return results
     }
 
+    // MARK: – Full Learning Reset
+
+    /// Wipes ALL learned data: bigram model (in-memory + disk) and user dictionary.
+    /// Called from the menu bar "Reset Learned Data" action.
+    /// After this call the engine behaves as if freshly installed — bigrams are
+    /// re-seeded with English defaults and user dictionary is empty.
+    func resetAllLearning() {
+        // Clear Layer 2 cache and cancel any in-flight tasks.
+        reset()
+        // Clear in-memory bigram model and re-seed with defaults.
+        bigramModel.reset()
+        // Persist the now-empty (seeded) model immediately so the clean state
+        // survives a restart instead of loading the old corrupted file.
+        saveBigramModel()
+        // Clear user dictionary.
+        userDictionary.resetAll()
+    }
+
     // MARK: – Context Reset
 
     /// Clears the Layer 2 AI cache and resets FM sessions.

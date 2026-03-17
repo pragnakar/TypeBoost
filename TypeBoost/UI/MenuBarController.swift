@@ -24,6 +24,11 @@ final class MenuBarController: NSObject {
     private let appIgnoreList: AppIgnoreList
     private let userDictionary: UserDictionary
 
+    /// Called when the user confirms "Reset Learned Data".
+    /// AppDelegate wires this to PredictionEngine.resetAllLearning() so
+    /// MenuBarController doesn't need a direct reference to PredictionEngine.
+    var onResetLearning: (() -> Void)?
+
     // MARK: – UI
 
     private var statusItem: NSStatusItem!
@@ -200,7 +205,7 @@ final class MenuBarController: NSObject {
         alert.addButton(withTitle: "Cancel")
 
         if alert.runModal() == .alertFirstButtonReturn {
-            userDictionary.resetAll()
+            onResetLearning?()
         }
     }
 
