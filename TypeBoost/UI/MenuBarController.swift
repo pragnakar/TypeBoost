@@ -135,14 +135,19 @@ final class MenuBarController: NSObject {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
-        // Launch at Login
+        // Launch at Login — read actual SMAppService status, not UserDefaults,
+        // so the checkmark reflects reality even if a previous registration failed.
         let launchItem = NSMenuItem(
             title: "Launch at Login",
             action: #selector(toggleLaunchAtLogin),
             keyEquivalent: ""
         )
         launchItem.target = self
-        launchItem.state = settings.launchAtLogin ? .on : .off
+        if #available(macOS 13.0, *) {
+            launchItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        } else {
+            launchItem.state = settings.launchAtLogin ? .on : .off
+        }
         menu.addItem(launchItem)
 
         menu.addItem(.separator())
@@ -231,19 +236,36 @@ final class MenuBarController: NSObject {
     }
 
     @objc private func toggleLaunchAtLogin() {
-        settings.launchAtLogin.toggle()
-        settings.save()
+        guard #available(macOS 13.0, *) else {
+            // Fallback for pre-13 — just toggle the stored preference.
+            settings.launchAtLogin.toggle()
+            settings.save()
+            return
+        }
 
-        if #available(macOS 13.0, *) {
-            do {
-                if settings.launchAtLogin {
-                    try SMAppService.mainApp.register()
-                } else {
-                    try SMAppService.mainApp.unregister()
-                }
-            } catch {
-                NSLog("[TypeBoost] Failed to update login item: \(error)")
+        let currentlyEnabled = SMAppService.mainApp.status == .enabled
+        do {
+            if currentlyEnabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
             }
+            // Keep settings in sync with actual state.
+            settings.launchAtLogin = SMAppService.mainApp.status == .enabled
+            settings.save()
+        } catch {
+            // Surface the failure — common causes: app not in /Applications,
+            // not code-signed, or macOS privacy denial.
+            let alert = NSAlert()
+            alert.messageText = currentlyEnabled ? "Could Not Disable Launch at Login"
+                                                 : "Could Not Enable Launch at Login"
+            alert.informativeText = """
+                \(error.localizedDescription)
+
+                Make sure TypeBoost is installed in /Applications and is code-signed.
+                """
+            alert.alertStyle = .warning
+            alert.runModal()
         }
     }
 
