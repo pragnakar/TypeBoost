@@ -105,6 +105,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             permissionManager.requestPermissions()
         }
 
+        // React to per-app disable/enable from the menu bar.
+        // AppIgnoreList is the source of truth; AppDelegate cleans up UI and state here
+        // so MenuBarController doesn't need a back-reference into AppDelegate.
+        appIgnoreList.$ignoredBundleIDs
+            .dropFirst() // skip the initial load
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                if self.appIgnoreList.isCurrentAppIgnored {
+                    // App was just added to ignore list — clean up exactly as global disable.
+                    self.suggestionWindow.hide()
+                    self.contextManager.reset()
+                    self.predictionEngine.reset()
+                    self.cancelNextWordMode()
+                    self.predictionMode = .prefixCompletion
+                    self.arrowKeyDebounceTimer?.invalidate()
+                    self.arrowKeyDebounceTimer = nil
+                    self.staticPollCount = 0
+                    TextInserter.invalidateCursorCache()
+                    TextInserter.lastClickPosition = nil
+                    TextInserter.lastKnownMousePosition = nil
+                } else {
+                    // App was just removed from ignore list — reset stale state,
+                    // same as re-enable so predictions start clean.
+                    self.contextManager.reset()
+                    self.predictionEngine.reset()
+                    self.cancelNextWordMode()
+                    self.predictionMode = .prefixCompletion
+                    self.staticPollCount = 0
+                    TextInserter.invalidateCursorCache()
+                    TextInserter.lastClickPosition = nil
+                    TextInserter.lastKnownMousePosition = nil
+                }
+            }
+            .store(in: &cancellables)
+
         // Re-check permissions when app becomes active.
         // Track the initial frontmost app so the first notification
         // doesn't spuriously reset context.

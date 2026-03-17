@@ -71,10 +71,12 @@ final class MenuBarController: NSObject {
 
         menu.addItem(.separator())
 
-        // Pause for current app
+        // Disable / Enable for current app — label reflects current ignore state.
+        let frontBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+        let isCurrentIgnored = appIgnoreList.isIgnored(frontBundleID)
         let pauseItem = NSMenuItem(
-            title: "Disable for Current App",
-            action: #selector(pauseForCurrentApp),
+            title: isCurrentIgnored ? "Enable for Current App" : "Disable for Current App",
+            action: isCurrentIgnored ? #selector(enableForCurrentApp) : #selector(pauseForCurrentApp),
             keyEquivalent: ""
         )
         pauseItem.target = self
@@ -169,9 +171,13 @@ final class MenuBarController: NSObject {
     }
 
     @objc private func pauseForCurrentApp() {
-        guard let frontApp = NSWorkspace.shared.frontmostApplication,
-              let bundleID = frontApp.bundleIdentifier else { return }
+        guard let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return }
         appIgnoreList.add(bundleID: bundleID)
+    }
+
+    @objc private func enableForCurrentApp() {
+        guard let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return }
+        appIgnoreList.remove(bundleID: bundleID)
     }
 
     @objc private func toggleLearning() {
