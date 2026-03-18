@@ -1091,4 +1091,75 @@ Using `NSScreen.main` instead of `NSScreen.screens.first` gives wrong results on
 
 **Fix:** Track consecutive failures per bundle ID in UserDefaults with a 24-hour TTL. Skip JS injection after 3 failures until TTL expires.
 
+### 21.11 WindowServer Crash on Screen Sleep (Watchdog Timeout)
+
+**Problem:** After extended idle or screen sleep, macOS WindowServer can crash with bug type 409 ("monitoring timed out") if TypeBoost's main thread is unresponsive for 40+ seconds. Root cause: `NSAppleScript` JS injection calls (on the `appleScriptSerial` queue) can block indefinitely when targeting suspended/sleeping browser processes. Combined with AXObserver notification bursts on wake, this can back up main-thread work beyond the WindowServer watchdog threshold.
+
+**Symptom:** `"indicator":"monitoring timed out for service"`, `"details":"WindowServer main thread unresponsive for 40 seconds"`, `"displayState":"OFF"` in crash report. Restarting TypeBoost immediately resolves it.
+
+**Fix:** Subscribe to four sleep/wake notifications and suspend/resume all monitoring:
+
+```swift
+// In applicationDidFinishLaunching:
+let wsCenter = NSWorkspace.shared.notificationCenter
+wsCenter.publisher(for: NSWorkspace.willSleepNotification)
+    .sink { [weak self] _ in self?.suspendForSleep() }.store(in: &cancellables)
+wsCenter.publisher(for: NSWorkspace.screensDidSleepNotification)
+    .sink { [weak self] _ in self?.suspendForSleep() }.store(in: &cancellables)
+wsCenter.publisher(for: NSWorkspace.didWakeNotification)
+    .sink { [weak self] _ in self?.resumeAfterWake() }.store(in: &cancellables)
+wsCenter.publisher(for: NSWorkspace.screensDidWakeNotification)
+    .sink { [weak self] _ in self?.resumeAfterWake() }.store(in: &cancellables)
+
+func suspendForSleep() {
+    repositionPollTimer?.invalidate(); repositionPollTimer = nil
+    teardownAXObserver()
+    keyboardMonitor.stop()
+    suggestionWindow.hide()
+    contextManager.reset(); predictionEngine.reset()
+    cancelNextWordMode(); predictionMode = .prefixCompletion
+    TextInserter.invalidateCursorCache()
+}
+
+func resumeAfterWake() {
+    // 1-second delay: lets AX subsystem and all apps finish restoring window state
+    // before we re-attach the AXObserver — prevents an immediate burst of stale notifications.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        guard let self, self.settings.isEnabled,
+              self.permissionManager.hasRequiredPermissions else { return }
+        self.keyboardMonitor.start()
+        if let app = NSWorkspace.shared.frontmostApplication {
+            self.setupAXObserver(pid: app.processIdentifier)
+            self.lastActiveBundleID = app.bundleIdentifier
+        }
+    }
+}
+```
+
+### 21.12 Next-Word Mode: activateSelection Must Be True
+
+**Problem:** If `generateNextWordSuggestions()` calls `show(suggestions:near:activateSelection:false)`, then `isSelectionActiveAtomic` is never set. The CGEventTap callback guards `numberSelect` emission on `isNavigationActive()` which reads `isSelectionActiveAtomic`. With it false, digit keys are never classified as `numberSelect` — they fall through as `character` events and dismiss the bar. Arrow keys also dismiss because `isSelectionActive == false` in the arrowLeft/arrowRight handlers.
+
+**Fix:** Always pass `activateSelection: true` when calling `show()` for next-word predictions. This ensures the first suggestion is highlighted immediately and digit/arrow keys work from the moment the bar appears.
+
+### 21.13 Chained Next-Word Prediction After Selection
+
+**Problem:** After the user selects a next-word suggestion, the inserted word becomes the new "last word" in context. Showing no predictions after insertion leaves the user with no guidance for the following word, breaking the natural flow.
+
+**Fix:** After inserting a next-word suggestion in `insertSuggestion(_:)`, do not hide the bar or reset to prefixCompletion. Instead:
+
+```swift
+case .nextWord:
+    TextInserter.replaceCurrent(partialLength: 0, replacement: suggestion.word + " ")
+    predictionEngine.recordAcceptance(suggestion)
+    contextManager.acceptSuggestion(suggestion.word)  // appends word to previousWords
+    cancelNextWordMode()                               // clears dismiss timer
+    TextInserter.invalidateCursorCache()
+    predictionMode = .nextWord
+    generateNextWordSuggestions()                      // immediately show next predictions
+    return  // skip the hide() + prefixCompletion reset below
+```
+
+The context manager's `acceptSuggestion` moves the inserted word into `previousWords`, so `predictNextWord(context:)` has the correct bigram context for the chain.
+
 ---
