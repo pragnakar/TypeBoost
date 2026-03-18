@@ -54,6 +54,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// All async reposition calls are suppressed during this window to prevent
     /// the bar from teleporting to stale cached coordinates mid-drag.
     private var isMouseButtonDown: Bool = false
+    /// True while an asyncRepositionBar Task is already in flight.
+    /// Prevents the AXObserver, poll timer, and keystroke path from all
+    /// spawning concurrent Tasks that each call AX/JS queries and then
+    /// race each other trying to set the window origin.
+    private var isRepositionInFlight: Bool = false
     /// Consecutive poll ticks where the bar didn't move. After 3 static ticks
     /// the poll interval backs off to 1s to reduce WindowServer compositing work.
     var staticPollCount: Int = 0
@@ -175,6 +180,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         .sink { [weak self] notification in self?.handleAppSwitch(notification) }
         .store(in: &cancellables)
 
+        // Suspend on system sleep and screen sleep; resume on wake.
+        // Without these, the AXObserver fires a notification burst on wake and
+        // the CGEventTap may be in a disabled state, both of which overload WindowServer.
+        let wsCenter = NSWorkspace.shared.notificationCenter
+        wsCenter.publisher(for: NSWorkspace.willSleepNotification)
+            .sink { [weak self] _ in self?.suspendForSleep() }
+            .store(in: &cancellables)
+        wsCenter.publisher(for: NSWorkspace.screensDidSleepNotification)
+            .sink { [weak self] _ in self?.suspendForSleep() }
+            .store(in: &cancellables)
+        wsCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .sink { [weak self] _ in self?.resumeAfterWake() }
+            .store(in: &cancellables)
+        wsCenter.publisher(for: NSWorkspace.screensDidWakeNotification)
+            .sink { [weak self] _ in self?.resumeAfterWake() }
+            .store(in: &cancellables)
+
         // Observe enable/disable toggle from settings.
         settings.$isEnabled
             .removeDuplicates()
@@ -182,6 +204,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 if enabled && self.permissionManager.hasRequiredPermissions {
                     self.keyboardMonitor.start()
+                    // Re-attach AXObserver to the current frontmost app —
+                    // it was torn down when disabled.
+                    if let app = NSWorkspace.shared.frontmostApplication {
+                        self.setupAXObserver(pid: app.processIdentifier)
+                        self.lastActiveBundleID = app.bundleIdentifier
+                    }
                     // Full state reset — user may have typed elsewhere or moved
                     // the cursor while TypeBoost was disabled.
                     self.contextManager.reset()
@@ -197,6 +225,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     self.keyboardMonitor.stop()
                     self.suggestionWindow.hide()
+                    // Tear down ALL active monitoring so the app is truly inert
+                    // while disabled. Without this, the AXObserver keeps firing
+                    // and handleAppSwitch keeps calling setupAXObserver — both of
+                    // which make live AX/JS calls that can block the main thread.
+                    self.repositionPollTimer?.invalidate()
+                    self.repositionPollTimer = nil
+                    self.arrowKeyDebounceTimer?.invalidate()
+                    self.arrowKeyDebounceTimer = nil
+                    self.teardownAXObserver()
+                    self.contextManager.reset()
+                    self.predictionEngine.reset()
+                    self.cancelNextWordMode()
+                    self.predictionMode = .prefixCompletion
+                    TextInserter.invalidateCursorCache()
                 }
             }
             .store(in: &cancellables)
@@ -207,6 +249,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         keyboardMonitor.stop()
         predictionEngine.saveBigramModel()
         settings.save()
+    }
+
+    // MARK: – Sleep / Wake / Screen-sleep
+
+    /// Suspend all monitoring and hide the bar on sleep or screen-off.
+    /// Without this, the AXObserver fires a burst of notifications on wake
+    /// (every app restoring its window state), flooding asyncRepositionBar
+    /// and hammering WindowServer with concurrent AX queries and reposition calls.
+    private func suspendForSleep() {
+        repositionPollTimer?.invalidate()
+        repositionPollTimer = nil
+        teardownAXObserver()
+        keyboardMonitor.stop()
+        suggestionWindow.hide()
+        contextManager.reset()
+        predictionEngine.reset()
+        cancelNextWordMode()
+        predictionMode = .prefixCompletion
+        TextInserter.invalidateCursorCache()
+    }
+
+    /// Resume monitoring after wake. Delay 1s to let the AX subsystem
+    /// and all apps finish restoring their window state — prevents an
+    /// immediate burst of stale AX notifications from the AXObserver.
+    private func resumeAfterWake() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.settings.isEnabled,
+                  self.permissionManager.hasRequiredPermissions else { return }
+            self.keyboardMonitor.start()
+            if let app = NSWorkspace.shared.frontmostApplication {
+                self.setupAXObserver(pid: app.processIdentifier)
+                self.lastActiveBundleID = app.bundleIdentifier
+            }
+        }
     }
 
     // MARK: – Event Binding
@@ -449,10 +525,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   after the user drags a window. Keystroke-triggered calls pass false and always
     ///   reposition unconditionally.
     fileprivate func asyncRepositionBar(fromPoll: Bool = false) {
-        // Suppress all repositioning while mouse button is held — the user may
-        // be dragging the window, and any AX/JS call would return stale geometry,
-        // producing a ghost bar at the old position.
-        guard !isMouseButtonDown else { return }
+        // Suppress while mouse is held (window drag) or a task is already in flight.
+        // Multiple callers — AXObserver, poll timer, keystroke — can all fire within
+        // the same 50ms window. Allowing them to all spawn concurrent Tasks results in
+        // multiple simultaneous AX queries that race each other to set the window origin,
+        // saturating the AX daemon and generating redundant WindowServer compositing work.
+        guard !isMouseButtonDown, !isRepositionInFlight else { return }
+        isRepositionInFlight = true
         Task { [weak self] in
             guard let self else { return }
             let bundleID = await MainActor.run {
@@ -460,7 +539,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let rect = await TextInserter.accurateCursorRect(bundleID: bundleID)
             await MainActor.run { [weak self] in
-                guard let self, self.suggestionWindow.isVisible else { return }
+                guard let self else {  return }
+                self.isRepositionInFlight = false
+                guard self.suggestionWindow.isVisible else { return }
                 if fromPoll {
                     self.suggestionWindow.repositionIfNearby(near: rect)
                 } else {
@@ -814,7 +895,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         arrowKeyDebounceTimer = nil
 
         // Re-register AXObserver for the new app so cursor moves are tracked instantly.
-        if let pid = (notification.userInfo?[NSWorkspace.applicationUserInfoKey]
+        // Skip when disabled — no reason to attach to AX processes while inert.
+        if settings.isEnabled,
+           let pid = (notification.userInfo?[NSWorkspace.applicationUserInfoKey]
             as? NSRunningApplication)?.processIdentifier {
             setupAXObserver(pid: pid)
         }
