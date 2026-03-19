@@ -521,12 +521,36 @@ enum TextInserter {
     /// Coordinate maths:
     ///   JS gives (x, y) in CSS pixels from screen top-left (same as AX/CG space).
     ///   AppKit origin is bottom-left:  appKitY = screenH - jsY - lineH
+    /// Maximum time (seconds) to wait for a single NSAppleScript execution.
+    /// If the target app is suspended (e.g. screen asleep), executeAndReturnError
+    /// blocks indefinitely. This timeout ensures we never hang the appleScriptQueue
+    /// longer than a few seconds — the WindowServer watchdog fires at 40s.
+    private static let jsExecutionTimeout: TimeInterval = 5.0
+
     static func jsCaretRect(bundleID: String, primaryScreenHeight: CGFloat) -> NSRect? {
         guard (jsFailureCount[bundleID] ?? 0) < maxJSFailures else { return nil }
         guard let script = compiledScript(for: bundleID) else { return nil }
 
+        // Run executeAndReturnError on a separate work item with a timeout.
+        // If the browser is suspended (screen asleep), this prevents an
+        // indefinite block that can starve WindowServer.
         var error: NSDictionary?
-        let result = script.executeAndReturnError(&error)
+        var result: NSAppleEventDescriptor?
+        let workItem = DispatchWorkItem {
+            var execError: NSDictionary?
+            let execResult = script.executeAndReturnError(&execError)
+            error = execError
+            result = execResult
+        }
+        let deadline: DispatchTime = .now() + jsExecutionTimeout
+        // We're already on appleScriptQueue, so dispatch to a concurrent queue
+        // and wait with a timeout.
+        DispatchQueue.global(qos: .userInitiated).async(execute: workItem)
+        let timedOut = workItem.wait(timeout: deadline) == .timedOut
+        if timedOut {
+            workItem.cancel()
+            return nil
+        }
 
         guard error == nil else {
             // Real AppleScript failure — "Allow JavaScript from Apple Events" likely off.
@@ -535,7 +559,7 @@ enum TextInserter {
             return nil
         }
 
-        let raw = result.stringValue ?? ""
+        let raw = result?.stringValue ?? ""
         // 'native' → focused element is <input>/<textarea>; use AX instead (not a failure).
         // 'null'   → no selection in current element (not a failure).
         guard raw != "native", raw != "null", !raw.isEmpty else { return nil }

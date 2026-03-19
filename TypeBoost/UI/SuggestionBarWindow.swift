@@ -65,7 +65,11 @@ final class SuggestionBarWindow: NSPanel {
         self.level = .init(rawValue: Int(CGWindowLevelForKey(.popUpMenuWindow)))
         self.isOpaque = false
         self.backgroundColor = .clear
-        self.hasShadow = true
+        // hasShadow = false: a real window shadow on a transparent NSVisualEffectView
+        // forces WindowServer to re-render the shadow mask on every compositing pass —
+        // including every position change and every alpha animation tick. The visual
+        // benefit is minimal; the CPU cost on WindowServer is significant.
+        self.hasShadow = false
         self.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
         self.isMovableByWindowBackground = false
         self.hidesOnDeactivate = false
@@ -89,15 +93,10 @@ final class SuggestionBarWindow: NSPanel {
 
         if self.isVisible {
             // Already showing — reposition synchronously (no layout recursion risk).
-            // Cancel any in-flight hide fade and ensure the bar is fully opaque.
-            // Without this, a hide→show race leaves the bar at alpha 0 (invisible)
-            // because hide() starts an 80ms fade before ordering out, and show()
-            // can fire during that fade via the synchronous path which never
-            // restored alpha.
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0
-                self.animator().alphaValue = 1.0
-            }
+            // Cancel any in-flight hide fade by directly setting alphaValue.
+            // NSAnimationContext(duration:0) + animator() still creates a CA transaction
+            // and is called on every keystroke — direct assignment avoids that cost.
+            self.alphaValue = 1.0
             _atomicVisible.withLock { $0 = true }
             suggestionView.resizeWindowToFitContent()
             positionPanel(near: cursorRect)
@@ -202,11 +201,8 @@ final class SuggestionBarWindow: NSPanel {
 
         if self.isVisible {
             // Already showing — reposition synchronously for zero-lag tracking.
-            // Cancel any in-flight hide fade (same race as in show()).
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0
-                self.animator().alphaValue = 1.0
-            }
+            // Cancel any in-flight hide fade with a direct alphaValue set (no CA transaction).
+            self.alphaValue = 1.0
             _atomicVisible.withLock { $0 = true }
             suggestionView.resizeWindowToFitContent()
             positionPanel(near: cursorRect)

@@ -75,6 +75,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: – Scroll throttle
 
+    /// True while the screen is off (locked / monitor blanked).
+    /// Prevents handleAppSwitch from re-creating the AXObserver
+    /// and asyncRepositionBar from making AX/JS calls while the
+    /// display is off — even though the Mac itself is still awake.
+    private var isSuspendedForSleep: Bool = false
+
     /// Last time a scroll event triggered asyncRepositionBar().
     /// Scroll fires at 50–100Hz; we reposition at most once per 100ms.
     private var lastScrollDate: Date = .distantPast
@@ -258,6 +264,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// (every app restoring its window state), flooding asyncRepositionBar
     /// and hammering WindowServer with concurrent AX queries and reposition calls.
     private func suspendForSleep() {
+        isSuspendedForSleep = true
         repositionPollTimer?.invalidate()
         repositionPollTimer = nil
         teardownAXObserver()
@@ -277,6 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self, self.settings.isEnabled,
                   self.permissionManager.hasRequiredPermissions else { return }
+            self.isSuspendedForSleep = false
             self.keyboardMonitor.start()
             if let app = NSWorkspace.shared.frontmostApplication {
                 self.setupAXObserver(pid: app.processIdentifier)
@@ -530,12 +538,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the same 50ms window. Allowing them to all spawn concurrent Tasks results in
         // multiple simultaneous AX queries that race each other to set the window origin,
         // saturating the AX daemon and generating redundant WindowServer compositing work.
-        guard !isMouseButtonDown, !isRepositionInFlight else { return }
+        guard !isMouseButtonDown, !isRepositionInFlight, settings.isEnabled, !isSuspendedForSleep else { return }
         isRepositionInFlight = true
         Task { [weak self] in
             guard let self else { return }
-            let bundleID = await MainActor.run {
-                NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+            // Re-check enabled state inside the Task — the user may have
+            // disabled the app or the screen may have gone to sleep between
+            // the guard above and this point.
+            let bundleID = await MainActor.run { () -> String in
+                guard self.settings.isEnabled, !self.isSuspendedForSleep else { return "" }
+                return NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+            }
+            guard !bundleID.isEmpty else {
+                await MainActor.run { self.isRepositionInFlight = false }
+                return
             }
             let rect = await TextInserter.accurateCursorRect(bundleID: bundleID)
             await MainActor.run { [weak self] in
@@ -895,8 +911,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         arrowKeyDebounceTimer = nil
 
         // Re-register AXObserver for the new app so cursor moves are tracked instantly.
-        // Skip when disabled — no reason to attach to AX processes while inert.
-        if settings.isEnabled,
+        // Skip when disabled or screen-off — no reason to attach to AX processes while inert.
+        if settings.isEnabled, !isSuspendedForSleep,
            let pid = (notification.userInfo?[NSWorkspace.applicationUserInfoKey]
             as? NSRunningApplication)?.processIdentifier {
             setupAXObserver(pid: pid)
